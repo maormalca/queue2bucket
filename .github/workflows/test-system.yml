@@ -1,0 +1,87 @@
+name: System Test
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-2
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./infra/terraform
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Get Terraform outputs
+        id: get_outputs
+        run: |
+          terraform init
+          ALB_DNS=$(terraform output -raw api_alb_dns_name)
+          S3_BUCKET=$(terraform output -raw s3_bucket_name)
+          echo "dns=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+          echo "Testing against ALB: $ALB_DNS"
+          echo "Using S3 bucket: $S3_BUCKET"
+
+      - name: Check API health
+        working-directory: ./
+        run: |
+          echo "Testing API endpoint..."
+          curl -f http://${{ steps.get_outputs.outputs.dns }}/ || exit 1
+
+      - name: Send test message
+        working-directory: ./
+        run: |
+          echo "Sending test email..."
+          RESPONSE=$(curl -s -X POST http://${{ steps.get_outputs.outputs.dns }}/email \
+            -H "Content-Type: application/json" \
+            -d '{
+              "data": {
+                "email_subject": "Test Email",
+                "email_sender": "maor@malca.com",
+                "email_timestream": "'$(date +%s)'",
+                "email_content": "Test message from GitHub Actions pipline test"
+              },
+              "token": "dev-secret-2025"
+            }')
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q "queued" || exit 1
+
+      - name: Wait for processing
+        working-directory: ./
+        run: sleep 15
+
+      - name: Check S3 for file
+        working-directory: ./
+        run: |
+          echo "Checking S3 bucket..."
+          LATEST=$(aws s3 ls s3://${{ steps.get_outputs.outputs.s3_bucket }}/emails/ --region ${{ env.AWS_REGION }} | tail -1 | awk '{print $4}')
+
+          if [ -z "$LATEST" ]; then
+            echo "No files found"
+            exit 1
+          fi
+
+          echo "Latest file: $LATEST"
+          aws s3 cp s3://${{ steps.get_outputs.outputs.s3_bucket }}/emails/$LATEST - --region ${{ env.AWS_REGION }}
+
+          echo "Test completed successfully"

@@ -1,0 +1,91 @@
+name: CD - Deploy to ECS
+
+on:
+  workflow_dispatch:  # manual deployment only
+    inputs:
+      service:
+        description: 'Service to deploy (api, uploader, or all)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - api
+          - uploader
+      api_image_tag:
+        description: 'API service image tag'
+        required: false
+        default: 'service1-api-latest'
+        type: string
+      uploader_image_tag:
+        description: 'S3 Uploader service image tag'
+        required: false
+        default: 'service2-s3uploader-latest'
+        type: string
+
+env:
+  AWS_REGION: us-east-2
+  ECS_CLUSTER: queue2bucket-cluster
+  API_SERVICE: queue2bucket-api-svc
+  UPLOADER_SERVICE: queue2bucket-service2-s3uploader-svc
+
+jobs:
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # setup AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # force new deployment pulls the latest image from ECR
+      - name: Deploy API service to ECS
+        run: |
+          IMAGE_TAG="${{ inputs.api_image_tag || 'service1-api-latest' }}"
+          echo "Deploying API service with image tag: $IMAGE_TAG"
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.API_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy S3 Uploader service to ECS
+        run: |
+          IMAGE_TAG="${{ inputs.uploader_image_tag || 'service2-s3uploader-latest' }}"
+          echo "Deploying S3 Uploader service with image tag: $IMAGE_TAG"
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.UPLOADER_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      # wait for both services to finish rolling update
+      - name: Wait for services to stabilize
+        run: |
+          echo "Waiting for services to reach steady state..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.API_SERVICE }} ${{ env.UPLOADER_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+
+      # show final deployment status
+      - name: Get service status
+        run: |
+          echo "ECS Services Status:"
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.API_SERVICE }} ${{ env.UPLOADER_SERVICE }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[*].[serviceName,status,runningCount,desiredCount]' \
+            --output table
